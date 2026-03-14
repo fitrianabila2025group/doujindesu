@@ -7,12 +7,15 @@ const TARGET_HOST = "doujindesu.tv";
 const TARGET_ORIGIN = "https://" + TARGET_HOST;
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || "/usr/bin/chromium-browser";
 
-const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-const SOURCE_DOMAINS = [
-  "doujindesu.tv",
-  "www.doujindesu.tv",
-];
+const SOURCE_DOMAINS = ["doujindesu.tv", "www.doujindesu.tv"];
+
+// ========== CACHE CONFIG ==========
+var HTML_CACHE_TTL = 5 * 60 * 1000;   // 5 min for HTML pages
+var ASSET_CACHE_TTL = 30 * 60 * 1000; // 30 min for CSS/JS/JSON
+var MAX_CACHE_ENTRIES = 500;
 
 // ========== BLOCK LIST ==========
 const blockedDomains = [
@@ -21,7 +24,6 @@ const blockedDomains = [
   "juicyads.com", "clickadu.com", "adsterra.com", "bidgear.com",
   "trafficjunky.com", "hilltopads.net", "pushame.com", "notix.io",
 ];
-
 const blockedAdLinkDomains = [
   "linkol.xyz", "dw.zeus.fun", "gacor.zone", "klik.top",
   "aksesin.top", "menujupenta.site", "gacor.vin", "cek.to",
@@ -30,43 +32,80 @@ const blockedAdLinkDomains = [
 function isBlockedDomain(s) {
   if (!s) return false;
   s = s.toLowerCase();
-  return blockedDomains.some(function (d) { return s === d || s.endsWith("." + d) || s.includes(d); });
+  return blockedDomains.some(function (d) {
+    return s === d || s.endsWith("." + d) || s.includes(d);
+  });
 }
 
-// ========== CHROME TLS AGENT ==========
-var CHROME_CIPHERS = [
-  "TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384",
-  "TLS_CHACHA20_POLY1305_SHA256",
-  "ECDHE-ECDSA-AES128-GCM-SHA256", "ECDHE-RSA-AES128-GCM-SHA256",
-  "ECDHE-ECDSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-GCM-SHA384",
-  "ECDHE-ECDSA-CHACHA20-POLY1305", "ECDHE-RSA-CHACHA20-POLY1305",
-  "ECDHE-RSA-AES128-SHA", "ECDHE-RSA-AES256-SHA",
-  "AES128-GCM-SHA256", "AES256-GCM-SHA384", "AES128-SHA", "AES256-SHA",
-].join(":");
+// ========== SCANNER / EXPLOIT PATH BLOCKER ==========
+var SCANNER_PATTERNS = /\.(env|git|svn|htaccess|htpasswd|ds_store|bak|sql|log|ini|conf|cfg|yml|yaml|toml|swp|old|orig|save|tmp|temp)$/i;
+var SCANNER_PATHS = /^\/(wp-login|wp-admin|wp-includes|wp-content\/uploads|administrator|admin|xmlrpc|cgi-bin|phpmyadmin|pma|mysql|myadmin|config|\.well-known\/security|telescope|api\/v1\/auth|actuator|solr|manager|jmx-console|debug|trace|info|console|shell|cmd|eval|exec|system|passw)/i;
 
+function isScannerRequest(pathname) {
+  return SCANNER_PATTERNS.test(pathname) || SCANNER_PATHS.test(pathname);
+}
+
+// ========== UNDICI AGENT (for static assets on CDN - no CF protection) ==========
 var tlsAgent = new Agent({
-  allowH2: true,
   connect: {
-    ciphers: CHROME_CIPHERS,
-    ecdhCurve: "X25519:P-256:P-384",
-    sigalgs: "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
-    minVersion: "TLSv1.2",
-    maxVersion: "TLSv1.3",
     rejectUnauthorized: true,
   },
 });
 
-// ========== CLOUDFLARE COOKIE MANAGER ==========
-// Uses headless Chrome to solve Cloudflare challenges and extract cookies
-var cfCookies = "";
-var cfCookieExpiry = 0;
-var cfRefreshing = false;
-var cfRefreshPromise = null;
+// ========== RESPONSE CACHE ==========
+// Cache: key = pathname+search, value = { body, headers, status, time }
+var pageCache = new Map();
+var inFlightRequests = new Map(); // deduplication: key -> Promise
+
+function getCacheKey(pathname, search) {
+  return pathname + (search || "");
+}
+
+function getFromCache(key) {
+  var entry = pageCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.time > entry.ttl) {
+    pageCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function putInCache(key, data, ttl) {
+  // Evict oldest if cache full
+  if (pageCache.size >= MAX_CACHE_ENTRIES) {
+    var oldest = pageCache.keys().next().value;
+    pageCache.delete(oldest);
+  }
+  pageCache.set(key, {
+    body: data.body,
+    headers: data.headers,
+    status: data.status,
+    contentType: data.contentType,
+    time: Date.now(),
+    ttl: ttl,
+  });
+}
+
+// ========== BROWSER MANAGER ==========
 var browser = null;
+var browserContext = null;
+
+// Page pool: reuse Chrome tabs instead of creating/destroying
+var pagePool = [];
+var PAGE_POOL_SIZE = 3;
+var pagePoolBusy = new Set();
 
 async function launchBrowser() {
-  if (browser) return browser;
-  console.log("[Chrome] Launching headless browser...");
+  if (browser && browser.isConnected()) return browser;
+  if (browser) {
+    try { await browser.close(); } catch (e) {}
+    browser = null;
+    browserContext = null;
+    pagePool = [];
+    pagePoolBusy.clear();
+  }
+  console.log("[Chrome] Launching browser...");
   browser = await puppeteer.launch({
     executablePath: CHROMIUM_PATH,
     headless: "new",
@@ -90,86 +129,134 @@ async function launchBrowser() {
       "--user-agent=" + BROWSER_UA,
     ],
   });
-  console.log("[Chrome] Browser launched successfully");
+
+  // Use a persistent context to keep cookies across page navigations
+  browserContext = browser;
+  console.log("[Chrome] Browser launched");
+
+  // Pre-warm the page pool
+  for (var i = 0; i < PAGE_POOL_SIZE; i++) {
+    try {
+      var p = await browser.newPage();
+      await p.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9,id;q=0.8" });
+      // Block ad/tracker resources in Chrome to speed up page loads
+      await p.setRequestInterception(true);
+      p.on("request", interceptRequest);
+      pagePool.push(p);
+    } catch (e) {
+      console.error("[Chrome] Failed to create pool page:", e.message);
+    }
+  }
+  console.log("[Chrome] Page pool ready: " + pagePool.length + " pages");
   return browser;
 }
 
-async function solveCfChallenge() {
-  console.log("[CF] Solving Cloudflare challenge via headless Chrome...");
-  var b = await launchBrowser();
-  var page = await b.newPage();
+// Intercept requests in Chrome to block ads/trackers (speeds up page loads)
+function interceptRequest(req) {
+  var url = req.url();
+  var rtype = req.resourceType();
 
+  // Block ad domains
+  if (isBlockedDomain(url)) {
+    req.abort("blockedbyclient");
+    return;
+  }
+
+  // Block tracking/ad resource types we don't need
+  if (rtype === "media" || rtype === "websocket" || rtype === "manifest") {
+    req.abort("blockedbyclient");
+    return;
+  }
+
+  req.continue();
+}
+
+// Get a page from pool, or create a new one
+async function acquirePage() {
+  await launchBrowser();
+  // Find an available pooled page
+  for (var i = 0; i < pagePool.length; i++) {
+    var pg = pagePool[i];
+    if (!pagePoolBusy.has(pg)) {
+      pagePoolBusy.add(pg);
+      return pg;
+    }
+  }
+  // All pool pages busy — create a temporary one
+  var tmpPage = await browser.newPage();
+  await tmpPage.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9,id;q=0.8" });
+  await tmpPage.setRequestInterception(true);
+  tmpPage.on("request", interceptRequest);
+  tmpPage._isTemp = true;
+  return tmpPage;
+}
+
+function releasePage(pg) {
+  if (pg._isTemp) {
+    pg.close().catch(function () {});
+    return;
+  }
+  pagePoolBusy.delete(pg);
+}
+
+// ========== CHROME PAGE FETCH ==========
+// Fetch a URL via Chrome (solves CF challenge automatically)
+async function chromeFetch(url) {
+  var page = await acquirePage();
   try {
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+    var resp = await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000,
     });
 
-    // Navigate to site - Chrome will automatically solve CF challenge
-    await page.goto(TARGET_ORIGIN, {
-      waitUntil: "networkidle2",
-      timeout: 30000,
-    });
+    // Wait a little for dynamic content, but not too long
+    await new Promise(function (r) { setTimeout(r, 1500); });
 
-    // Wait extra time for CF challenge JS to complete
-    await new Promise(function (r) { setTimeout(r, 5000); });
-
-    // Check if still on challenge page, wait more
-    var pageContent = await page.content();
-    if (pageContent.includes("challenge-platform") || pageContent.includes("Just a moment")) {
-      console.log("[CF] Challenge page detected, waiting longer...");
-      await new Promise(function (r) { setTimeout(r, 10000); });
+    // Check if CF challenge page
+    var title = await page.title();
+    if (title.includes("Just a moment") || title.includes("Attention Required")) {
+      // Wait for CF to resolve
+      console.log("[Chrome] CF challenge on " + url + ", waiting...");
+      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(function () {});
+      await new Promise(function (r) { setTimeout(r, 2000); });
     }
 
-    // Extract all cookies
-    var cookies = await page.cookies();
-    var cookieStr = cookies.map(function (c) { return c.name + "=" + c.value; }).join("; ");
+    var status = resp ? resp.status() : 200;
+    var body = await page.content();
+    var ct = resp ? (resp.headers()["content-type"] || "text/html") : "text/html";
 
-    var hasCfClearance = cookies.some(function (c) { return c.name === "cf_clearance"; });
-
-    if (hasCfClearance) {
-      console.log("[CF] Got cf_clearance cookie successfully!");
-    } else {
-      console.log("[CF] No cf_clearance found, using all cookies anyway. Cookie names:", cookies.map(function (c) { return c.name; }).join(", "));
-    }
-
-    cfCookies = cookieStr;
-    // Refresh every 10 minutes (cf_clearance usually lasts 15-30 min)
-    cfCookieExpiry = Date.now() + 10 * 60 * 1000;
-
-    console.log("[CF] Cookies obtained: " + cookies.length + " cookies");
-    return cookieStr;
-  } catch (err) {
-    console.error("[CF] Challenge solve failed:", err.message);
-    return cfCookies; // return old cookies if any
+    return { body: body, status: status, contentType: ct };
   } finally {
-    await page.close().catch(function () {});
+    // Navigate to blank to free memory, then release
+    await page.goto("about:blank", { timeout: 5000 }).catch(function () {});
+    releasePage(page);
   }
 }
 
-async function getCfCookies() {
-  // Return cached cookies if still valid
-  if (cfCookies && Date.now() < cfCookieExpiry) {
-    return cfCookies;
+// Coalesced Chrome fetch: deduplicate concurrent requests for same URL
+async function chromeFetchCoalesced(url, cacheKey) {
+  // Check cache first
+  var cached = getFromCache(cacheKey);
+  if (cached) return cached;
+
+  // Check if already in-flight
+  if (inFlightRequests.has(cacheKey)) {
+    return inFlightRequests.get(cacheKey);
   }
 
-  // Prevent multiple simultaneous refreshes
-  if (cfRefreshing) {
-    return cfRefreshPromise;
-  }
+  // Start fetch and register as in-flight
+  var promise = chromeFetch(url)
+    .then(function (result) {
+      inFlightRequests.delete(cacheKey);
+      return result;
+    })
+    .catch(function (err) {
+      inFlightRequests.delete(cacheKey);
+      throw err;
+    });
 
-  cfRefreshing = true;
-  cfRefreshPromise = solveCfChallenge().finally(function () {
-    cfRefreshing = false;
-    cfRefreshPromise = null;
-  });
-
-  return cfRefreshPromise;
-}
-
-// Force refresh (called when we detect CF block on a response)
-async function forceRefreshCfCookies() {
-  cfCookieExpiry = 0;
-  return getCfCookies();
+  inFlightRequests.set(cacheKey, promise);
+  return promise;
 }
 
 // ========== DOMAIN REWRITING ==========
@@ -190,14 +277,12 @@ function rewriteSeo(body, mirrorHost, mirrorProto, pathname) {
   var origin = mirrorProto + "://" + mirrorHost;
   var canonical = origin + pathname;
 
-  // Remove old canonical, og:url, hreflang, noindex
   body = body.replace(/<link\s+[^>]*rel=["']canonical["'][^>]*\/?>/gi, "");
   body = body.replace(/<meta\s+[^>]*property=["']og:url["'][^>]*\/?>/gi, "");
   body = body.replace(/<link\s+[^>]*rel=["']alternate["'][^>]*hreflang[^>]*\/?>/gi, "");
   body = body.replace(/<meta\s+[^>]*name=["']robots["'][^>]*content=["'][^"']*noindex[^"']*["'][^>]*\/?>/gi, "");
   body = body.replace(/<meta\s+[^>]*content=["'][^"']*noindex[^"']*["'][^>]*name=["']robots["'][^>]*\/?>/gi, "");
 
-  // Rewrite og:image, twitter:image
   body = body.replace(
     /(<meta\s+[^>]*(?:property|name)=["'](?:og:image|og:image:url|og:image:secure_url|twitter:image)[^"']*["'][^>]*content=["'])([^"']+)(["'][^>]*\/?>)/gi,
     function (m, before, url, after) {
@@ -206,7 +291,6 @@ function rewriteSeo(body, mirrorHost, mirrorProto, pathname) {
     }
   );
 
-  // Rewrite JSON-LD
   body = body.replace(
     /<script\s+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
     function (m, json) {
@@ -220,7 +304,6 @@ function rewriteSeo(body, mirrorHost, mirrorProto, pathname) {
     }
   );
 
-  // Inject canonical + og:url + robots
   var tags =
     '<link rel="canonical" href="' + canonical + '" />\n' +
     '<meta property="og:url" content="' + canonical + '" />\n' +
@@ -229,7 +312,6 @@ function rewriteSeo(body, mirrorHost, mirrorProto, pathname) {
     body = body.replace(/(<head[^>]*>)/i, "$1\n" + tags + "\n");
   }
 
-  // Rewrite srcset, data-src, form actions, inline CSS url()
   body = body.replace(/(srcset=["'])([^"']+)(["'])/gi, function (m, b, s, a) {
     for (var i = 0; i < SOURCE_DOMAINS.length; i++) s = s.split(SOURCE_DOMAINS[i]).join(mirrorHost);
     return b + s + a;
@@ -251,8 +333,11 @@ function rewriteSeo(body, mirrorHost, mirrorProto, pathname) {
 }
 
 // ========== ADBLOCK ==========
+var adblockScriptCache = null;
 function buildAdblockScript() {
-  return '\n<style id="proxy-adblock-css">\n' +
+  if (adblockScriptCache) return adblockScriptCache;
+  adblockScriptCache =
+    '\n<style id="proxy-adblock-css">\n' +
     'div[style*="position:fixed"][style*="z-index:2147483647"],\n' +
     'div[style*="position: fixed"][style*="z-index:2147483647"],\n' +
     'div[style*="position:fixed"][style*="z-index:99999"],\n' +
@@ -287,6 +372,7 @@ function buildAdblockScript() {
     'setInterval(cl,2000);\n' +
     'if(window.MutationObserver){var o=new MutationObserver(function(m){for(var i=0;i<m.length;i++)if(m[i].addedNodes&&m[i].addedNodes.length){cl();break;}});o.observe(document.documentElement,{childList:true,subtree:true});}\n' +
     '})();\n</script>\n';
+  return adblockScriptCache;
 }
 
 // ========== HELPERS ==========
@@ -298,13 +384,91 @@ function getMirrorProto(req) {
   if (p) return p.split(",")[0].trim();
   return "https";
 }
-function collectBody(req) {
-  return new Promise(function (resolve, reject) {
-    var chunks = [];
-    req.on("data", function (c) { chunks.push(c); });
-    req.on("end", function () { resolve(Buffer.concat(chunks)); });
-    req.on("error", reject);
-  });
+
+// Process HTML body: rewrite, SEO, adblock
+function processHtml(body, mirrorHost, mirrorProto, pathname) {
+  var mirrorOrigin = mirrorProto + "://" + mirrorHost;
+
+  body = deepRewrite(body, mirrorHost, mirrorProto);
+  body = rewriteSeo(body, mirrorHost, mirrorProto, pathname);
+
+  // Remove ad banners
+  for (var i = 0; i < blockedAdLinkDomains.length; i++) {
+    var ad = blockedAdLinkDomains[i];
+    body = body.replace(
+      new RegExp(
+        "<center>\\s*<a\\s+[^>]*href=[\"'][^\"']*" +
+          ad.replace(/\./g, "\\.") +
+          "[^\"']*[\"'][^>]*>\\s*<img[^>]*>\\s*</a>\\s*</center>",
+        "gi"
+      ),
+      ""
+    );
+  }
+  body = body.replace(
+    /<center>\s*<a\s+[^>]*rel=["']nofollow["'][^>]*>\s*<img\s+[^>]*blogger\.googleusercontent\.com[^>]*>\s*<\/a>\s*<\/center>/gi,
+    ""
+  );
+
+  // Inject adblock
+  var abs = buildAdblockScript();
+  if (body.includes("</body>")) body = body.replace("</body>", abs + "</body>");
+  else if (body.includes("</BODY>")) body = body.replace("</BODY>", abs + "</BODY>");
+  else body += abs;
+
+  return body;
+}
+
+// ========== STATIC ASSET PROXY (CDN, no CF protection) ==========
+// Images, CSS, JS from cdn.doujindesu.dev or similar CDNs bypass CF
+async function proxyStaticAsset(targetUrl, req, res, mirrorHost, mirrorProto) {
+  try {
+    var headers = {
+      "User-Agent": BROWSER_UA,
+      "Accept": req.headers["accept"] || "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "identity",
+      "Referer": TARGET_ORIGIN + "/",
+    };
+
+    var resp = await undiFetch(targetUrl, {
+      method: req.method,
+      headers: headers,
+      redirect: "follow",
+      dispatcher: tlsAgent,
+    });
+
+    var ct = resp.headers.get("content-type") || "application/octet-stream";
+
+    // Skip headers we don't want to forward
+    var skipH = new Set([
+      "content-security-policy", "content-security-policy-report-only",
+      "x-frame-options", "content-length", "content-encoding",
+      "transfer-encoding", "connection",
+    ]);
+    var respH = {};
+    resp.headers.forEach(function (v, k) {
+      if (!skipH.has(k.toLowerCase())) respH[k] = v;
+    });
+    respH["access-control-allow-origin"] = "*";
+    respH["cache-control"] = "public, max-age=86400"; // 24h browser cache for assets
+
+    // Rewrite text-based assets
+    if (ct.includes("text/css") || ct.includes("javascript") || ct.includes("application/json") ||
+        ct.includes("xml") || ct.includes("rss") || ct.includes("atom")) {
+      var tb = await resp.text();
+      tb = deepRewrite(tb, mirrorHost, mirrorProto);
+      res.writeHead(resp.status, respH);
+      res.end(Buffer.from(tb, "utf-8"));
+    } else {
+      res.writeHead(resp.status, respH);
+      res.end(Buffer.from(await resp.arrayBuffer()));
+    }
+  } catch (err) {
+    console.error("[Asset] Failed to fetch:", targetUrl, err.message);
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("Bad Gateway");
+  }
 }
 
 // ========== MAIN HANDLER ==========
@@ -314,280 +478,113 @@ async function handleRequest(req, res) {
   var mirrorOrigin = mirrorProto + "://" + mirrorHost;
   var requestUrl = new URL(req.url, mirrorOrigin);
   var pathname = requestUrl.pathname;
+  var search = requestUrl.search;
+
+  // ========== BLOCK SCANNERS ==========
+  if (isScannerRequest(pathname)) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+    return;
+  }
+
+  // ========== BLOCK ADS ==========
+  var rl = requestUrl.toString().toLowerCase();
+  if (isBlockedDomain(rl)) {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   // ========== ROBOTS.TXT ==========
   if (pathname === "/robots.txt") {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" });
+    res.writeHead(200, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "public, max-age=3600",
+    });
     res.end("User-agent: *\nAllow: /\n\nSitemap: " + mirrorOrigin + "/sitemap.xml\n");
     return;
   }
 
-  // ========== SITEMAP ==========
-  if (pathname === "/sitemap.xml" || pathname.startsWith("/sitemap")) {
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      res.writeHead(405);
-      res.end("Method Not Allowed");
-      return;
-    }
-    var cookies = await getCfCookies();
-    var sResp;
-    try {
-      sResp = await undiFetch("https://" + TARGET_HOST + pathname, {
-        dispatcher: tlsAgent,
-        headers: {
-          "Host": TARGET_HOST,
-          "User-Agent": BROWSER_UA,
-          "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Accept-Encoding": "identity",
-          "Referer": TARGET_ORIGIN + "/",
-          "Cookie": cookies,
-        },
-      });
-    } catch (e) {
-      res.writeHead(502);
-      res.end("Bad Gateway");
-      return;
-    }
-    var sBody = await sResp.text();
-    sBody = deepRewrite(sBody, mirrorHost, mirrorProto);
-    res.writeHead(sResp.status, {
-      "Content-Type": "application/xml; charset=utf-8",
-      "Cache-Control": "public, max-age=3600",
+  // ========== STATIC ASSETS (images, fonts, etc. on CDN) ==========
+  // These are typically served from CDN without CF protection
+  var ext = pathname.split(".").pop().toLowerCase();
+  var staticExts = {
+    jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1, avif: 1, svg: 1, ico: 1,
+    woff: 1, woff2: 1, ttf: 1, eot: 1, otf: 1,
+    mp4: 1, webm: 1, mp3: 1, ogg: 1,
+  };
+
+  if (staticExts[ext]) {
+    var assetUrl = "https://" + TARGET_HOST + pathname + search;
+    return proxyStaticAsset(assetUrl, req, res, mirrorHost, mirrorProto);
+  }
+
+  // CSS/JS files — also try direct fetch (usually no CF protection)
+  if (ext === "css" || ext === "js") {
+    var textAssetUrl = "https://" + TARGET_HOST + pathname + search;
+    return proxyStaticAsset(textAssetUrl, req, res, mirrorHost, mirrorProto);
+  }
+
+  // ========== HTML PAGES (via Chrome with caching) ==========
+  var cacheKey = getCacheKey(pathname, search);
+
+  // Check cache first
+  var cached = getFromCache(cacheKey);
+  if (cached) {
+    var cachedBody = processHtml(cached.body, mirrorHost, mirrorProto, pathname);
+    res.writeHead(cached.status, {
+      "Content-Type": "text/html; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
+      "X-Robots-Tag": "index, follow",
+      "Link": "<" + mirrorOrigin + pathname + '>; rel="canonical"',
+      "X-Cache": "HIT",
+      "Cache-Control": "public, max-age=60",
     });
-    res.end(sBody);
+    res.end(Buffer.from(cachedBody, "utf-8"));
     return;
   }
 
-  // ========== BLOCK CHECK ==========
-  var rl = requestUrl.toString().toLowerCase();
-  if (isBlockedDomain(requestUrl.hostname.toLowerCase()) || isBlockedDomain(rl)) {
-    res.writeHead(204); res.end(); return;
-  }
-  if (rl.includes("/get/")) {
-    var hh = requestUrl.hostname.toLowerCase();
-    if (!hh.includes(TARGET_HOST) && !hh.includes(mirrorHost)) {
-      res.writeHead(204); res.end(); return;
-    }
-  }
-
-  // ========== GET CF COOKIES ==========
-  var cookies = await getCfCookies();
-
-  // ========== BUILD UPSTREAM REQUEST ==========
-  var targetUrl = new URL(requestUrl.toString());
-  targetUrl.hostname = TARGET_HOST;
-  targetUrl.protocol = "https:";
-
-  var fetchHeaders = {
-    "Host": TARGET_HOST,
-    "User-Agent": BROWSER_UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-    "Accept-Encoding": "identity",
-    "Referer": TARGET_ORIGIN + "/",
-    "Cookie": cookies,
-    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  };
-
-  // Merge visitor cookies with CF cookies
-  if (req.headers["cookie"]) {
-    fetchHeaders["Cookie"] = cookies + "; " + req.headers["cookie"];
-  }
-
-  var fetchOpts = {
-    method: req.method,
-    headers: fetchHeaders,
-    redirect: "manual",
-    dispatcher: tlsAgent,
-  };
-
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    var bodyBuf = await collectBody(req);
-    if (bodyBuf.length > 0) fetchOpts.body = bodyBuf;
-  }
-
-  var response;
+  // Fetch via Chrome (with deduplication)
+  var targetUrl = "https://" + TARGET_HOST + pathname + search;
+  var result;
   try {
-    response = await undiFetch(targetUrl.toString(), fetchOpts);
+    result = await chromeFetchCoalesced(targetUrl, cacheKey);
   } catch (err) {
+    console.error("[Fetch] Failed:", pathname, err.message);
     res.writeHead(502, { "Content-Type": "text/plain" });
     res.end("Bad Gateway");
     return;
   }
 
-  // ========== DETECT CF CHALLENGE & RETRY WITH FRESH COOKIES ==========
-  var cfMitigated = response.headers.get("cf-mitigated") || "";
-  if (
-    (response.status === 403 || response.status === 503) &&
-    (cfMitigated.toLowerCase() === "challenge" || (response.headers.get("server") || "").includes("cloudflare"))
-  ) {
-    console.log("[CF] Challenge detected on " + pathname + " (status " + response.status + "), refreshing cookies...");
-    var freshCookies = await forceRefreshCfCookies();
-    fetchHeaders["Cookie"] = freshCookies + (req.headers["cookie"] ? "; " + req.headers["cookie"] : "");
-    fetchOpts.headers = fetchHeaders;
-
-    try {
-      response = await undiFetch(targetUrl.toString(), fetchOpts);
-    } catch (err) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Bad Gateway");
-      return;
-    }
-
-    // If STILL challenged, use Chrome directly for this page
-    cfMitigated = response.headers.get("cf-mitigated") || "";
-    if (
-      (response.status === 403 || response.status === 503) &&
-      (cfMitigated.toLowerCase() === "challenge" || (response.headers.get("server") || "").includes("cloudflare"))
-    ) {
-      console.log("[CF] Still challenged after cookie refresh, using Chrome directly for: " + pathname);
-      return await handleViaBrowser(req, res, targetUrl.toString(), mirrorHost, mirrorProto, pathname);
-    }
-  }
-
-  // ========== HANDLE REDIRECT ==========
-  if ([301, 302, 303, 307, 308].includes(response.status)) {
-    var loc = response.headers.get("location");
-    if (loc) {
-      if (isBlockedDomain(loc)) { res.writeHead(204); res.end(); return; }
-      var newLoc;
-      try {
-        var lu = new URL(loc, TARGET_ORIGIN);
-        lu.hostname = mirrorHost;
-        lu.protocol = mirrorProto + ":";
-        newLoc = lu.toString();
-      } catch (e) {
-        newLoc = deepRewrite(loc, mirrorHost, mirrorProto);
-      }
-      var rh = {};
-      response.headers.forEach(function (v, k) { rh[k] = v; });
-      rh["location"] = newLoc;
-      res.writeHead(response.status, rh);
-      res.end(Buffer.from(await response.arrayBuffer()));
-      return;
-    }
-  }
-
-  // ========== RESPONSE HEADERS ==========
-  var skipH = new Set([
-    "content-security-policy", "content-security-policy-report-only",
-    "x-frame-options", "content-length", "content-encoding",
-    "transfer-encoding", "connection", "link",
-  ]);
-  var respH = {};
-  response.headers.forEach(function (v, k) {
-    if (!skipH.has(k.toLowerCase())) respH[k] = v;
-  });
-  respH["access-control-allow-origin"] = "*";
-
-  var ct = response.headers.get("content-type") || "";
-
-  // ========== HTML ==========
-  if (ct.includes("text/html")) {
-    var body = await response.text();
-    body = deepRewrite(body, mirrorHost, mirrorProto);
-    body = rewriteSeo(body, mirrorHost, mirrorProto, pathname);
-
-    // Remove ad banners
-    for (var ad of blockedAdLinkDomains) {
-      body = body.replace(new RegExp(
-        "<center>\\s*<a\\s+[^>]*href=[\"'][^\"']*" + ad.replace(/\./g, "\\.") + "[^\"']*[\"'][^>]*>\\s*<img[^>]*>\\s*</a>\\s*</center>", "gi"
-      ), "");
-    }
-    body = body.replace(/<center>\s*<a\s+[^>]*rel=["']nofollow["'][^>]*>\s*<img\s+[^>]*blogger\.googleusercontent\.com[^>]*>\s*<\/a>\s*<\/center>/gi, "");
-
-    // Inject adblock
-    var abs = buildAdblockScript();
-    if (body.includes("</body>")) body = body.replace("</body>", abs + "</body>");
-    else if (body.includes("</BODY>")) body = body.replace("</BODY>", abs + "</BODY>");
-    else body += abs;
-
-    // Rewrite cookies
-    var sc = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
-    if (sc.length) {
-      delete respH["set-cookie"];
-      respH["set-cookie"] = sc.map(function (c) { return c.replace(/domain=[^;]+/gi, "domain=" + mirrorHost); });
-    }
-
-    respH["content-type"] = "text/html; charset=utf-8";
-    respH["x-robots-tag"] = "index, follow";
-    respH["link"] = "<" + mirrorOrigin + pathname + '>; rel="canonical"';
-
-    res.writeHead(response.status, respH);
-    res.end(Buffer.from(body, "utf-8"));
-    return;
-  }
-
-  // ========== CSS / JS / JSON / XML ==========
-  if (ct.includes("text/css") || ct.includes("javascript") || ct.includes("application/json") ||
-      ct.includes("xml") || ct.includes("rss") || ct.includes("atom")) {
-    var tb = await response.text();
-    tb = deepRewrite(tb, mirrorHost, mirrorProto);
-    res.writeHead(response.status, respH);
-    res.end(Buffer.from(tb, "utf-8"));
-    return;
-  }
-
-  // ========== BINARY ==========
-  res.writeHead(response.status, respH);
-  res.end(Buffer.from(await response.arrayBuffer()));
-}
-
-// ========== FALLBACK: DIRECT CHROME FETCH ==========
-// When undici+cookies fails, use Chrome directly to fetch the page
-async function handleViaBrowser(req, res, url, mirrorHost, mirrorProto, pathname) {
-  var b = await launchBrowser();
-  var page = await b.newPage();
-  try {
-    var resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
-    await new Promise(function (r) { setTimeout(r, 3000); });
-
-    var body = await page.content();
-    body = deepRewrite(body, mirrorHost, mirrorProto);
-    body = rewriteSeo(body, mirrorHost, mirrorProto, pathname);
-
-    // Remove ads
-    for (var ad of blockedAdLinkDomains) {
-      body = body.replace(new RegExp(
-        "<center>\\s*<a\\s+[^>]*href=[\"'][^\"']*" + ad.replace(/\./g, "\\.") + "[^\"']*[\"'][^>]*>\\s*<img[^>]*>\\s*</a>\\s*</center>", "gi"
-      ), "");
-    }
-
-    var abs = buildAdblockScript();
-    if (body.includes("</body>")) body = body.replace("</body>", abs + "</body>");
-    else body += abs;
-
-    // Update stored cookies from this page visit
-    var pageCookies = await page.cookies();
-    cfCookies = pageCookies.map(function (c) { return c.name + "=" + c.value; }).join("; ");
-    cfCookieExpiry = Date.now() + 10 * 60 * 1000;
-
-    var status = resp ? resp.status() : 200;
-    res.writeHead(status, {
+  // If result was from cache (deduplication returned cached)
+  if (result.time) {
+    var rBody = processHtml(result.body, mirrorHost, mirrorProto, pathname);
+    res.writeHead(result.status, {
       "Content-Type": "text/html; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
       "X-Robots-Tag": "index, follow",
-      "Link": "<" + mirrorProto + "://" + mirrorHost + pathname + '>; rel="canonical"',
+      "Link": "<" + mirrorOrigin + pathname + '>; rel="canonical"',
+      "X-Cache": "HIT",
     });
-    res.end(Buffer.from(body, "utf-8"));
-  } catch (err) {
-    console.error("[Chrome] Direct fetch failed:", err.message);
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Bad Gateway");
-    }
-  } finally {
-    await page.close().catch(function () {});
+    res.end(Buffer.from(rBody, "utf-8"));
+    return;
   }
+
+  // Store raw body in cache (before rewriting, so we rewrite per-request with correct host)
+  putInCache(cacheKey, result, HTML_CACHE_TTL);
+
+  // Process and return
+  var processedBody = processHtml(result.body, mirrorHost, mirrorProto, pathname);
+
+  res.writeHead(result.status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "X-Robots-Tag": "index, follow",
+    "Link": "<" + mirrorOrigin + pathname + '>; rel="canonical"',
+    "X-Cache": "MISS",
+    "Cache-Control": "public, max-age=60",
+  });
+  res.end(Buffer.from(processedBody, "utf-8"));
 }
 
 // ========== SERVER ==========
@@ -603,18 +600,31 @@ var server = http.createServer(async function (req, res) {
   }
 });
 
-// Pre-solve CF challenge on startup
-getCfCookies().then(function () {
-  console.log("[Startup] CF cookies ready");
-}).catch(function (err) {
-  console.error("[Startup] CF cookie pre-fetch failed:", err.message);
-});
+// Launch browser and pre-warm cache on startup
+launchBrowser()
+  .then(function () {
+    console.log("[Startup] Browser ready");
+    // Pre-warm homepage cache
+    return chromeFetchCoalesced(TARGET_ORIGIN + "/", "/");
+  })
+  .then(function (result) {
+    putInCache("/", result, HTML_CACHE_TTL);
+    console.log("[Startup] Homepage cached (" + result.body.length + " bytes)");
+  })
+  .catch(function (err) {
+    console.error("[Startup] Pre-warm failed:", err.message);
+  });
 
 server.listen(PORT, "0.0.0.0", function () {
   console.log("Mirror proxy running on port " + PORT);
 });
 
-// Clean up browser on exit
+// Cache stats logging every 5 minutes
+setInterval(function () {
+  console.log("[Cache] Entries: " + pageCache.size + ", In-flight: " + inFlightRequests.size + ", Pool busy: " + pagePoolBusy.size + "/" + pagePool.length);
+}, 5 * 60 * 1000);
+
+// Clean up on exit
 process.on("SIGTERM", async function () {
   if (browser) await browser.close().catch(function () {});
   process.exit(0);
