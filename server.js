@@ -2,13 +2,12 @@ const http = require("http");
 
 const PORT = process.env.PORT || 3000;
 const TARGET_HOST = "doujindesu.tv";
-const SITEMAP_SOURCE = "doujindesu.wasmer.app";
+const SITEMAP_SOURCE = "doujindesu.tv";
 
 // All source domains that need rewriting to the mirror domain
 const SOURCE_DOMAINS = [
   "doujindesu.tv",
   "www.doujindesu.tv",
-  "doujindesu.wasmer.app",
 ];
 
 // ========== BLOCK LIST ==========

@@ -5,13 +5,12 @@ export default {
     const originalProto = url.protocol.replace(":", "");
     const originalOrigin = originalProto + "://" + originalHost;
     const targetHost = "doujindesu.tv";
-    const sitemapSource = "doujindesu.wasmer.app";
+    const sitemapSource = "doujindesu.tv";
 
     // All source domains to rewrite
     const sourceDomains = [
       "doujindesu.tv",
       "www.doujindesu.tv",
-      "doujindesu.wasmer.app",
     ];
 
     // ========== BLOCK LIST ==========
