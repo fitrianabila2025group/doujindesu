@@ -4,3 +4,5 @@ npm-debug.log
 .gitignore
 README.md
 workers.js
+js/
+botasaurus-master*
