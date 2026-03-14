@@ -4,6 +4,9 @@ const PORT = process.env.PORT || 3000;
 const TARGET_HOST = "doujindesu.tv";
 const SITEMAP_SOURCE = "doujindesu.tv";
 
+// Realistic browser User-Agent
+const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 // All source domains that need rewriting to the mirror domain
 const SOURCE_DOMAINS = [
   "doujindesu.tv",
@@ -332,8 +335,10 @@ async function handleRequest(req, res) {
       sitemapResp = await fetch(sitemapUrl, {
         method: req.method,
         headers: {
-          "User-Agent": req.headers["user-agent"] || "Mozilla/5.0",
-          Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
+          "User-Agent": BROWSER_UA,
+          "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": "https://" + TARGET_HOST + "/",
         },
       });
     } catch (e) {
@@ -375,22 +380,37 @@ async function handleRequest(req, res) {
   targetUrl.hostname = TARGET_HOST;
   targetUrl.protocol = "https:";
 
-  var fetchHeaders = {
-    Host: TARGET_HOST,
-    Origin: "https://" + TARGET_HOST,
-    Referer: "https://" + TARGET_HOST + "/",
-  };
-
+  // Headers that should not be forwarded
   var skipRequestHeaders = new Set([
     "host", "origin", "referer",
-    "cf-connecting-ip", "cf-ray", "cf-visitor",
+    "cf-connecting-ip", "cf-ray", "cf-visitor", "cf-ipcountry", "cf-worker",
+    "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",
+    "x-real-ip", "x-request-id",
     "connection", "transfer-encoding",
+    "via", "forwarded",
   ]);
 
-  for (var entry of Object.entries(req.headers)) {
-    if (!skipRequestHeaders.has(entry[0].toLowerCase())) {
-      fetchHeaders[entry[0]] = entry[1];
-    }
+  // Build headers that look like a real browser
+  var fetchHeaders = {
+    "Host": TARGET_HOST,
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+    "Accept-Encoding": "identity",
+    "Referer": "https://" + TARGET_HOST + "/",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+  };
+
+  // Copy cookies from visitor (important for session)
+  if (req.headers["cookie"]) {
+    fetchHeaders["Cookie"] = req.headers["cookie"];
   }
 
   var fetchOptions = {

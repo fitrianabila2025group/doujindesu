@@ -175,12 +175,15 @@ export default {
         return new Response("Method Not Allowed", { status: 405 });
       }
 
+      const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
       const sitemapUrl = "https://" + sitemapSource + url.pathname;
       const resp = await fetch(sitemapUrl, {
         method: request.method,
         headers: {
-          "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0",
-          Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
+          "User-Agent": browserUA,
+          "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": "https://" + targetHost + "/",
         },
       });
 
@@ -213,13 +216,29 @@ export default {
     url.hostname = targetHost;
 
     // ========== HEADERS ==========
-    const newHeaders = new Headers(request.headers);
+    const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+    const newHeaders = new Headers();
     newHeaders.set("Host", targetHost);
-    newHeaders.set("Origin", "https://" + targetHost);
+    newHeaders.set("User-Agent", browserUA);
+    newHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8");
+    newHeaders.set("Accept-Language", "en-US,en;q=0.9,id;q=0.8");
+    newHeaders.set("Accept-Encoding", "identity");
     newHeaders.set("Referer", "https://" + targetHost + "/");
-    newHeaders.delete("cf-connecting-ip");
-    newHeaders.delete("cf-ray");
-    newHeaders.delete("cf-visitor");
+    newHeaders.set("Sec-Ch-Ua", '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"');
+    newHeaders.set("Sec-Ch-Ua-Mobile", "?0");
+    newHeaders.set("Sec-Ch-Ua-Platform", '"Windows"');
+    newHeaders.set("Sec-Fetch-Dest", "document");
+    newHeaders.set("Sec-Fetch-Mode", "navigate");
+    newHeaders.set("Sec-Fetch-Site", "same-origin");
+    newHeaders.set("Sec-Fetch-User", "?1");
+    newHeaders.set("Upgrade-Insecure-Requests", "1");
+
+    // Forward cookies from visitor (important for session)
+    const visitorCookie = request.headers.get("Cookie");
+    if (visitorCookie) {
+      newHeaders.set("Cookie", visitorCookie);
+    }
 
     // ========== BUILD REQUEST ==========
     const init = {
