@@ -1,8 +1,40 @@
 const http = require("http");
+const { fetch: undiFetch, Agent } = require("undici");
 
 const PORT = process.env.PORT || 3000;
 const TARGET_HOST = "doujindesu.tv";
 const SITEMAP_SOURCE = "doujindesu.tv";
+
+// Chrome-like TLS configuration to bypass Cloudflare JA3 fingerprinting
+const CHROME_CIPHERS = [
+  "TLS_AES_128_GCM_SHA256",
+  "TLS_AES_256_GCM_SHA384",
+  "TLS_CHACHA20_POLY1305_SHA256",
+  "ECDHE-ECDSA-AES128-GCM-SHA256",
+  "ECDHE-RSA-AES128-GCM-SHA256",
+  "ECDHE-ECDSA-AES256-GCM-SHA384",
+  "ECDHE-RSA-AES256-GCM-SHA384",
+  "ECDHE-ECDSA-CHACHA20-POLY1305",
+  "ECDHE-RSA-CHACHA20-POLY1305",
+  "ECDHE-RSA-AES128-SHA",
+  "ECDHE-RSA-AES256-SHA",
+  "AES128-GCM-SHA256",
+  "AES256-GCM-SHA384",
+  "AES128-SHA",
+  "AES256-SHA",
+].join(":");
+
+const tlsAgent = new Agent({
+  allowH2: true,
+  connect: {
+    ciphers: CHROME_CIPHERS,
+    ecdhCurve: "X25519:P-256:P-384",
+    sigalgs: "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
+    minVersion: "TLSv1.2",
+    maxVersion: "TLSv1.3",
+    rejectUnauthorized: true,
+  },
+});
 
 // Realistic browser User-Agent
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -332,8 +364,9 @@ async function handleRequest(req, res) {
     var sitemapUrl = "https://" + SITEMAP_SOURCE + pathname;
     var sitemapResp;
     try {
-      sitemapResp = await fetch(sitemapUrl, {
+      sitemapResp = await undiFetch(sitemapUrl, {
         method: req.method,
+        dispatcher: tlsAgent,
         headers: {
           "User-Agent": BROWSER_UA,
           "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
@@ -417,6 +450,7 @@ async function handleRequest(req, res) {
     method: req.method,
     headers: fetchHeaders,
     redirect: "manual",
+    dispatcher: tlsAgent,
   };
 
   if (req.method !== "GET" && req.method !== "HEAD") {
@@ -427,12 +461,38 @@ async function handleRequest(req, res) {
   }
 
   var response;
-  try {
-    response = await fetch(targetUrl.toString(), fetchOptions);
-  } catch (err) {
-    res.writeHead(502, { "Content-Type": "text/plain" });
-    res.end("Bad Gateway");
-    return;
+  var retries = 0;
+  var maxRetries = 2;
+  while (retries <= maxRetries) {
+    try {
+      response = await undiFetch(targetUrl.toString(), fetchOptions);
+    } catch (err) {
+      retries++;
+      if (retries > maxRetries) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("Bad Gateway");
+        return;
+      }
+      await new Promise(function (r) { setTimeout(r, 1000 * retries); });
+      continue;
+    }
+
+    // Detect Cloudflare challenge (403 with cf-mitigated or challenge page)
+    var cfMitigated = response.headers.get("cf-mitigated") || "";
+    if (
+      (response.status === 403 || response.status === 503) &&
+      (cfMitigated.toLowerCase() === "challenge" ||
+        response.headers.get("server") === "cloudflare")
+    ) {
+      retries++;
+      if (retries > maxRetries) {
+        console.error("Cloudflare challenge detected after " + maxRetries + " retries for: " + pathname);
+        break; // proceed with the challenge response - will be rewritten
+      }
+      await new Promise(function (r) { setTimeout(r, 2000 * retries); });
+      continue;
+    }
+    break;
   }
 
   // ========== HANDLE REDIRECT ==========

@@ -7,5 +7,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "undici": "^6.21.1"
   }
 }
